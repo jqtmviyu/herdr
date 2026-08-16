@@ -1443,7 +1443,10 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
-    if shell.contains(std::path::MAIN_SEPARATOR) {
+    // `is_absolute` additionally recognizes Windows forward-slash paths
+    // such as `C:/Program Files/Git/bin/bash.exe`, which the separator
+    // check alone would wrongly send to the PATH lookup.
+    if shell.contains(std::path::MAIN_SEPARATOR) || Path::new(shell).is_absolute() {
         let path = Path::new(shell);
         return is_executable_file(path)
             .then(|| shell.to_string())
@@ -1489,15 +1492,42 @@ fn resolve_shell_for_login_mode(shell: &str) -> io::Result<String> {
 /// prompt would show success after a failed command (verified on 5.1).
 pub(crate) const WINDOWS_POWERSHELL_SHELL_INTEGRATION_COMMAND: &str = r"if ($null -eq $global:__HerdrOriginalPrompt) { $global:__HerdrOriginalPrompt = $function:prompt; function global:prompt { $out = @(& $global:__HerdrOriginalPrompt) -join ' '; $loc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($loc.Provider.Name -eq 'FileSystem') { $esc = [string][char]27; $out += $esc + ']9;9;' + $loc.ProviderPath + $esc + '\' }; $out } }";
 
+/// Login-shell startup flags for Windows. portable-pty's default-prog path
+/// resolves to `ComSpec` on Windows and ignores the `SHELL` env var, and the
+/// Unix argv0-prefix login convention does not exist there, so a login shell
+/// must be launched directly with the shell's own login flag. Only POSIX
+/// sh-family shells have one (`-l` is the portable form; bash and zsh also
+/// accept `--login`); Windows-native shells such as powershell and cmd have
+/// no login concept and launch plain.
+fn windows_login_shell_argv(shell: &str) -> &'static [&'static str] {
+    let name = shell
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell)
+        .to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    match name {
+        "sh" | "bash" | "zsh" | "ksh" | "dash" | "ash" | "mksh" => &["-l"],
+        _ => &[],
+    }
+}
+
 fn pane_shell_command_builder_for_target(
     shell_config: PaneShellConfig<'_>,
     target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
     if shell_mode_uses_login_shell(shell_config.mode, target) {
-        let mut cmd = CommandBuilder::new_default_prog();
-        cmd.env("SHELL", resolve_shell_for_login_mode(&shell)?);
-        Ok(cmd)
+        let resolved = resolve_shell_for_login_mode(&shell)?;
+        if target == ShellLaunchTarget::Windows {
+            let mut cmd = CommandBuilder::new(&resolved);
+            cmd.args(windows_login_shell_argv(&resolved));
+            Ok(cmd)
+        } else {
+            let mut cmd = CommandBuilder::new_default_prog();
+            cmd.env("SHELL", resolved);
+            Ok(cmd)
+        }
     } else {
         let mut cmd = CommandBuilder::new(&shell);
         if uses_windows_powershell_pane_shell_for_target(shell_config, target) {
@@ -3312,6 +3342,140 @@ mod tests {
             cmd.get_env("SHELL").and_then(std::ffi::OsStr::to_str),
             Some("/bin/sh")
         );
+    }
+
+    #[test]
+    fn windows_login_shell_builder_launches_resolved_shell_with_login_flag() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-windows-login-shell-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let shell = base.join("bash.exe");
+        std::fs::write(&shell, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new(
+                shell.to_str().unwrap(),
+                crate::config::ShellModeConfig::Login,
+            ),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(!cmd.is_default_prog());
+        assert_eq!(
+            cmd.get_argv(),
+            &[shell.as_os_str().to_owned(), std::ffi::OsString::from("-l")]
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn windows_login_shell_builder_launches_cmd_without_flag() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-windows-login-shell-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let shell = base.join("cmd.exe");
+        std::fs::write(&shell, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let cmd = pane_shell_command_builder_for_target(
+            PaneShellConfig::new(
+                shell.to_str().unwrap(),
+                crate::config::ShellModeConfig::Login,
+            ),
+            ShellLaunchTarget::Windows,
+        )
+        .unwrap();
+
+        assert!(!cmd.is_default_prog());
+        assert_eq!(cmd.get_argv(), &[shell.as_os_str().to_owned()]);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn windows_login_shell_argv_maps_sh_family_to_login_flag() {
+        for shell in [
+            "bash",
+            "bash.exe",
+            "BASH.EXE",
+            "zsh",
+            "zsh.exe",
+            "sh",
+            "sh.exe",
+            "ksh",
+            "dash",
+            "ash",
+            "mksh",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_argv(shell),
+                &["-l"],
+                "shell {shell:?} should get the login flag"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_login_shell_argv_omits_flag_for_shells_without_login_concept() {
+        for shell in [
+            "cmd",
+            "cmd.exe",
+            "powershell",
+            "powershell.exe",
+            "pwsh",
+            "pwsh.exe",
+            "fish.exe",
+            "nu",
+            "C:\\Windows\\System32\\cmd.exe",
+        ] {
+            assert_eq!(
+                windows_login_shell_argv(shell),
+                &[] as &[&str],
+                "shell {shell:?} must not get a login flag"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn login_shell_resolution_accepts_forward_slash_absolute_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-login-shell-fwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let shell = base.join("bash.exe");
+        std::fs::write(&shell, b"").unwrap();
+        let forward = shell.to_string_lossy().replace('\\', "/");
+
+        assert_eq!(resolve_shell_for_login_mode(&forward).unwrap(), forward);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
